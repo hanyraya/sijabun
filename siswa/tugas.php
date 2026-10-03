@@ -1,0 +1,315 @@
+<?php
+require_once __DIR__ . '/../includes/header.php';
+require_once __DIR__ . '/../config/database.php';
+
+// Proteksi Khusus Siswa (Role ID 3)
+check_access([3]);
+
+$db = Database::getInstance();
+
+// Dapatkan Data Siswa & Kelasnya
+$stmt_s = $db->prepare("SELECT id, kelas_id FROM siswa WHERE user_id = ?");
+$stmt_s->execute([$_SESSION['user_id']]);
+$siswa = $stmt_s->fetch();
+$siswa_id = $siswa['id'] ?? 0;
+$kelas_id = $siswa['kelas_id'] ?? 0;
+
+// Ambil Daftar Tugas Berdasarkan Kelas Siswa
+$stmt_t = $db->prepare("
+    SELECT t.*, m.nama_mapel, g.nama_lengkap as nama_guru, pt.id pengumpulan_id, pt.nilai,
+           pt.catatan_guru, pt.file_tugas as jawaban_file,pt.nama_file_asli,pt.ukuran_file,pt.dikumpulkan_pada
+    FROM tugas t
+    JOIN pengajaran p ON t.pengajaran_id = p.id
+    JOIN mapel m ON p.mapel_id = m.id
+    JOIN guru g ON p.guru_id = g.id
+    JOIN akses_pertemuan ap ON ap.pengajaran_id=t.pengajaran_id
+                           AND ap.pertemuan_ke=t.pertemuan_ke AND ap.status='Dibuka'
+    LEFT JOIN pengumpulan_tugas pt ON (pt.tugas_id = t.id AND pt.siswa_id = ?)
+    WHERE p.kelas_id = ? AND t.metode_pengumpulan='online'
+    AND (NOT EXISTS(
+        SELECT 1 FROM materi mat
+        WHERE mat.pengajaran_id=t.pengajaran_id AND mat.pertemuan_ke=t.pertemuan_ke
+    ) OR (
+        EXISTS(
+            SELECT 1 FROM materi mat
+            JOIN materi_siswa_dibaca msb ON msb.materi_id=mat.id AND msb.siswa_id=?
+            WHERE mat.pengajaran_id=t.pengajaran_id AND mat.pertemuan_ke=t.pertemuan_ke
+        )
+    ))
+    ORDER BY (t.deadline < NOW()) ASC, t.deadline ASC
+");
+$stmt_t->execute([$siswa_id, $kelas_id, $siswa_id]);
+$tugas_list = $stmt_t->fetchAll();
+$pertanyaan_per_tugas=[];
+if($tugas_list){
+    $ids=array_map(static fn($t)=>(int)$t['id'],$tugas_list);
+    $ph=implode(',',array_fill(0,count($ids),'?'));
+    $stmt_q=$db->prepare("SELECT pt.id,pt.tugas_id,pt.pertanyaan,pt.urutan,ot.id opsi_id,ot.label_opsi,ot.teks_opsi FROM pertanyaan_tugas pt LEFT JOIN opsi_tugas ot ON ot.pertanyaan_id=pt.id WHERE pt.tugas_id IN($ph) ORDER BY pt.tugas_id,pt.urutan,ot.label_opsi");
+    $stmt_q->execute($ids);
+    foreach($stmt_q->fetchAll() as $r){$tid=(int)$r['tugas_id'];$pid=(int)$r['id'];if(!isset($pertanyaan_per_tugas[$tid][$pid]))$pertanyaan_per_tugas[$tid][$pid]=['id'=>$pid,'pertanyaan'=>$r['pertanyaan'],'opsi'=>[]];if($r['opsi_id'])$pertanyaan_per_tugas[$tid][$pid]['opsi'][]=['id'=>(int)$r['opsi_id'],'label'=>$r['label_opsi'],'teks'=>$r['teks_opsi']];}
+}
+$daftar_mapel=[];foreach($tugas_list as $item)$daftar_mapel[$item['nama_mapel']]=$item['nama_mapel'];ksort($daftar_mapel);
+$filter_status=$_GET['status']??'semua';$filter_mapel=trim($_GET['mapel']??'');$filter_pengajaran=(int)($_GET['pengajaran_id']??0);$filter_pertemuan=(int)($_GET['pertemuan']??0);if(!in_array($filter_status,['semua','aktif','selesai','terlambat'],true))$filter_status='semua';
+$tugas_list=array_values(array_filter($tugas_list,static function($item)use($filter_status,$filter_mapel,$filter_pengajaran,$filter_pertemuan){$submitted=!empty($item['pengumpulan_id']);$expired=strtotime($item['deadline'])<time();$statusOk=$filter_status==='semua'||($filter_status==='selesai'&&$submitted)||($filter_status==='aktif'&&!$submitted&&!$expired)||($filter_status==='terlambat'&&!$submitted&&$expired);return $statusOk&&($filter_mapel===''||$item['nama_mapel']===$filter_mapel)&&(!$filter_pengajaran||(int)$item['pengajaran_id']===$filter_pengajaran)&&(!$filter_pertemuan||(int)$item['pertemuan_ke']===$filter_pertemuan);}));
+
+// Batasi jumlah kartu agar halaman tetap ringkas meskipun tugas sangat banyak.
+$tugas_per_halaman = 3;
+$total_tugas = count($tugas_list);
+$total_halaman = max(1, (int)ceil($total_tugas / $tugas_per_halaman));
+$halaman = max(1, min((int)($_GET['page'] ?? 1), $total_halaman));
+$tugas_list = array_slice($tugas_list, ($halaman - 1) * $tugas_per_halaman, $tugas_per_halaman);
+?>
+
+<?php require_once __DIR__ . '/../includes/sidebar.php'; ?>
+
+<style>
+    .student-task-grid { --task-radius: 15px; }
+    .student-task-card { border-radius: var(--task-radius); transition: transform .18s ease, box-shadow .18s ease; }
+    .student-task-card .task-title { font-size: 1rem; line-height: 1.35; overflow-wrap: anywhere; }
+    .student-task-card .badge { font-size: .68rem; font-weight: 650; }
+    .student-task-card .task-meta { font-size: .76rem; line-height: 1.45; }
+    .task-instruction { background:#f8fafc; border:1px solid #edf1f6; border-radius:11px; }
+    .task-instruction summary { cursor:pointer; list-style:none; font-size:.78rem; color:#475569; }
+    .task-instruction summary::-webkit-details-marker { display:none; }
+    .task-instruction summary::after { content:"+"; float:right; font-weight:700; }
+    .task-instruction[open] summary::after { content:"−"; }
+    .task-instruction .instruction-copy { max-height:130px; overflow:auto; padding-top:8px; font-size:.78rem; line-height:1.5; }
+    .task-deadline { font-size:.75rem; line-height:1.4; }
+    .student-task-card .btn-sm { min-height:36px; font-size:.78rem; }
+    .upload-choice { border:1px solid #e4eaf2; border-radius:13px; padding:12px; background:#f8fafc; }
+    .camera-preview { max-height:260px; width:100%; object-fit:contain; border-radius:12px; background:#eef2f7; }
+    @media (hover:hover) and (min-width:992px) { .student-task-card:hover { transform:translateY(-2px); box-shadow:0 .5rem 1.25rem rgba(15,23,42,.1)!important; } }
+    @media (max-width:575.98px) {
+        .student-task-grid { --bs-gutter-y:.7rem; }
+        .student-task-card { border-radius:13px; }
+        .student-task-card .card-body { padding:14px!important; }
+    }
+</style>
+
+<div id="page-content-wrapper">
+    <nav class="navbar navbar-expand-lg navbar-light top-navbar px-3 px-md-4 py-3">
+        <div>
+            <h5 class="mb-0 fw-bold"><i class="fa-solid fa-list-check text-primary me-2"></i>Daftar Tugas Saya</h5>
+            <small class="text-muted">Baca instruksi, unduh soal, lalu kirim jawaban</small>
+        </div>
+    </nav>
+
+    <div class="container-fluid p-3 p-md-4">
+        <form class="card border-0 shadow-sm p-3 mb-3" method="get"><div class="row g-2"><div class="col-6"><select class="form-select form-select-sm" name="status"><option value="semua">Semua Status</option><?php foreach(['aktif'=>'Aktif','selesai'=>'Selesai','terlambat'=>'Terlambat'] as $key=>$label): ?><option value="<?= $key ?>" <?= $filter_status===$key?'selected':'' ?>><?= $label ?></option><?php endforeach ?></select></div><div class="col-6"><select class="form-select form-select-sm" name="mapel"><option value="">Semua Mapel</option><?php foreach($daftar_mapel as $mapel): ?><option value="<?= sanitize($mapel) ?>" <?= $filter_mapel===$mapel?'selected':'' ?>><?= sanitize($mapel) ?></option><?php endforeach ?></select></div><div class="col-12 d-grid"><button class="btn btn-sm btn-primary"><i class="fa-solid fa-filter me-1"></i>Terapkan Filter</button></div></div></form>
+        <?php if (!$tugas_list): ?>
+            <div class="card border-0 shadow-sm text-center p-5">
+                <i class="fa-solid fa-clipboard-check fa-3x text-primary opacity-50 mb-3"></i>
+                <h6 class="fw-bold">Belum ada tugas</h6>
+                <p class="text-muted mb-0">Guru belum memberikan tugas untuk kelas Anda.</p>
+            </div>
+        <?php endif; ?>
+        <div class="row g-3 student-task-grid">
+            <?php foreach($tugas_list as $t): 
+                $is_submitted = !empty($t['pengumpulan_id']);
+                $is_expired   = strtotime(date('Y-m-d H:i:s')) > strtotime($t['deadline']);
+            ?>
+            <div class="col-12 col-md-6 col-xl-4">
+                <article class="card student-task-card border-0 shadow-sm h-100" id="tugas-<?= (int)$t['id'] ?>">
+                <div class="card-body p-3 d-flex flex-column">
+                    <div class="d-flex justify-content-between align-items-start mb-2">
+                        <span class="badge bg-info text-dark"><?= sanitize($t['nama_mapel']) ?></span>
+                        <?php if($is_submitted): ?>
+                            <span class="badge bg-success"><i class="fa-solid fa-check-circle me-1"></i> Sudah Dikirim</span>
+                        <?php elseif($is_expired): ?>
+                            <span class="badge bg-danger">Waktu Habis</span>
+                        <?php else: ?>
+                            <span class="badge bg-warning text-dark">Belum Dikumpul</span>
+                        <?php endif; ?>
+                    </div>
+
+                    <h2 class="task-title fw-bold mb-1"><?= sanitize($t['judul']) ?></h2>
+                    <?php $label_jenis=['portofolio'=>'Portofolio','esai'=>'Esai','pilihan_ganda'=>'Pilihan Ganda','merangkum'=>'Merangkum','video'=>'Pembuatan Video']; ?>
+                    <span class="badge bg-primary-subtle text-primary align-self-start mb-2"><?= sanitize($label_jenis[$t['jenis_tugas']] ?? 'Portofolio') ?></span>
+                    <p class="task-meta text-muted mb-2">Guru: <?= sanitize($t['nama_guru']) ?> &middot; Pertemuan <?= (int)$t['pertemuan_ke'] ?></p>
+                    <?php if ($t['deskripsi']): ?>
+                        <details class="task-instruction p-2 mb-2">
+                            <summary class="fw-semibold"><i class="fa-solid fa-align-left me-1"></i> Lihat instruksi tugas</summary>
+                            <div class="instruction-copy text-secondary"><?= nl2br(sanitize($t['deskripsi'])) ?></div>
+                        </details>
+                    <?php endif; ?>
+
+                    <?php if ($t['file_lampiran']): ?>
+                        <a href="file_pembelajaran.php?jenis=tugas&amp;id=<?= (int)$t['id'] ?>&amp;mode=preview" target="_blank" rel="noopener" class="btn btn-primary btn-sm w-100 mb-2">
+                            <i class="fa-solid fa-file-arrow-down me-1"></i> Buka / Unduh Soal Tugas
+                        </a>
+                    <?php else: ?>
+                        <div class="alert alert-light border small py-2 px-2 mb-2">
+                            <i class="fa-solid fa-circle-info text-muted me-1"></i> Tugas ini tidak memiliki lampiran. Ikuti instruksi yang tertulis.
+                        </div>
+                    <?php endif; ?>
+
+                    <div class="border-top pt-2 mt-auto">
+                        <div class="d-flex flex-wrap justify-content-between align-items-center gap-1 mb-2">
+                            <small class="task-deadline text-danger fw-semibold">
+                                <i class="fa-regular fa-clock me-1"></i><?= date('d M Y, H:i', strtotime($t['deadline'])) ?>
+                            </small>
+                            <?php if($t['nilai'] !== null): ?>
+                                <span class="badge bg-primary">Nilai: <?= $t['nilai'] ?></span>
+                            <?php endif; ?>
+                        </div>
+
+                        <?php if($is_submitted): ?>
+                            <button class="btn btn-success btn-sm w-100" disabled>
+                                <i class="fa-solid fa-circle-check me-1"></i> Tugas Sudah Dikumpulkan
+                            </button>
+                            <?php $ukuran_aktual=$t['ukuran_file'];if(!$ukuran_aktual&&$t['jawaban_file']){$path_jawaban=__DIR__.'/../assets/upload/jawaban/'.basename($t['jawaban_file']);$ukuran_aktual=is_file($path_jawaban)?filesize($path_jawaban):null;} ?>
+                            <div class="border rounded bg-light p-2 mt-2 small">
+                                <div class="fw-semibold mb-1"><i class="fa-solid fa-receipt text-success me-1"></i>Bukti Pengumpulan</div>
+                                <?php if($t['jawaban_file']): ?><div class="text-truncate" title="<?= sanitize($t['nama_file_asli']?:$t['jawaban_file']) ?>"><i class="fa-solid fa-paperclip text-muted me-1"></i><?= sanitize($t['nama_file_asli']?:$t['jawaban_file']) ?></div><?php else: ?><div class="text-muted"><i class="fa-solid fa-keyboard me-1"></i>Jawaban dikirim melalui formulir</div><?php endif; ?>
+                                <div class="text-muted mt-1"><?= $ukuran_aktual?($ukuran_aktual<1048576?number_format($ukuran_aktual/1024,0).' KB':number_format($ukuran_aktual/1048576,2).' MB'):'Ukuran tidak tersedia' ?> · <?= $t['dikumpulkan_pada']?date('d/m/Y H:i',strtotime($t['dikumpulkan_pada'])):'-' ?></div>
+                                <span class="badge <?= $t['nilai']===null?'bg-warning text-dark':'bg-success' ?> mt-2"><?= $t['nilai']===null?'Menunggu Penilaian':'Sudah Dinilai' ?></span>
+                            </div>
+                        <?php elseif(!$is_expired): ?>
+                            <button type="button" class="btn btn-outline-primary btn-sm w-100" onclick='openSubmitModal(<?= json_encode(["id"=>(int)$t["id"],"judul"=>$t["judul"],"jenis"=>$t["jenis_tugas"]??"portofolio","pertanyaan"=>array_values($pertanyaan_per_tugas[(int)$t["id"]]??[])], JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT) ?>)'>
+                                <i class="fa-solid fa-paper-plane me-1"></i> Kirim Jawaban
+                            </button>
+                        <?php else: ?>
+                            <button class="btn btn-secondary btn-sm w-100" disabled>Pengumpulan Ditutup</button>
+                        <?php endif; ?>
+
+                        <?php if ($is_submitted): ?>
+                            <?php if($t['jawaban_file']): ?><a href="file_pembelajaran.php?jenis=jawaban&amp;id=<?= (int)$t['pengumpulan_id'] ?>&amp;mode=preview" target="_blank" rel="noopener" class="btn btn-link btn-sm w-100 mt-1">
+                                <i class="fa-solid fa-eye me-1"></i> Lihat jawaban yang sudah dikirim
+                            </a><?php endif; ?>
+                        <?php endif; ?>
+
+                        <?php if ($t['catatan_guru']): ?>
+                            <div class="alert alert-primary small mt-3 mb-0">
+                                <strong><i class="fa-solid fa-comment-dots me-1"></i> Catatan Guru</strong><br>
+                                <?= nl2br(sanitize($t['catatan_guru'])) ?>
+                            </div>
+                        <?php endif; ?>
+                    </div>
+                </div>
+                </article>
+            </div>
+            <?php endforeach; ?>
+        </div>
+
+        <?php if ($total_tugas > 0): ?>
+            <nav class="mt-4" aria-label="Navigasi halaman tugas">
+                <div class="d-flex d-md-none justify-content-between align-items-center gap-2">
+                    <a class="btn btn-sm btn-outline-primary <?= $halaman <= 1 ? 'disabled' : '' ?>" href="?<?= http_build_query(['status'=>$filter_status,'mapel'=>$filter_mapel,'pengajaran_id'=>$filter_pengajaran,'pertemuan'=>$filter_pertemuan,'page'=>max(1,$halaman-1)]) ?>"><i class="fa-solid fa-chevron-left me-1"></i>Sebelumnya</a>
+                    <small class="text-muted">Halaman <?= $halaman ?> / <?= $total_halaman ?></small>
+                    <a class="btn btn-sm btn-outline-primary <?= $halaman >= $total_halaman ? 'disabled' : '' ?>" href="?<?= http_build_query(['status'=>$filter_status,'mapel'=>$filter_mapel,'pengajaran_id'=>$filter_pengajaran,'pertemuan'=>$filter_pertemuan,'page'=>min($total_halaman,$halaman+1)]) ?>">Berikutnya<i class="fa-solid fa-chevron-right ms-1"></i></a>
+                </div>
+                <ul class="pagination pagination-sm justify-content-center d-none d-md-flex mb-0">
+                    <li class="page-item <?= $halaman <= 1 ? 'disabled' : '' ?>"><a class="page-link" href="?<?= http_build_query(['status'=>$filter_status,'mapel'=>$filter_mapel,'pengajaran_id'=>$filter_pengajaran,'pertemuan'=>$filter_pertemuan,'page'=>max(1,$halaman-1)]) ?>" aria-label="Sebelumnya">&laquo;</a></li>
+                    <?php for ($nomor = 1; $nomor <= $total_halaman; $nomor++): ?>
+                        <li class="page-item <?= $nomor === $halaman ? 'active' : '' ?>"><a class="page-link" href="?<?= http_build_query(['status'=>$filter_status,'mapel'=>$filter_mapel,'pengajaran_id'=>$filter_pengajaran,'pertemuan'=>$filter_pertemuan,'page'=>$nomor]) ?>"><?= $nomor ?></a></li>
+                    <?php endfor; ?>
+                    <li class="page-item <?= $halaman >= $total_halaman ? 'disabled' : '' ?>"><a class="page-link" href="?<?= http_build_query(['status'=>$filter_status,'mapel'=>$filter_mapel,'pengajaran_id'=>$filter_pengajaran,'pertemuan'=>$filter_pertemuan,'page'=>min($total_halaman,$halaman+1)]) ?>" aria-label="Berikutnya">&raquo;</a></li>
+                </ul>
+                <p class="text-center text-muted small mt-2 mb-0">Menampilkan maksimal <?= $tugas_per_halaman ?> dari <?= $total_tugas ?> tugas</p>
+            </nav>
+        <?php endif; ?>
+    </div>
+</div>
+
+<!-- Modal Pengumpulan Tugas -->
+<div class="modal fade" id="submitModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title fw-bold" id="modalTugasTitle">Kirim Jawaban Tugas</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <form id="formKirimTugas" enctype="multipart/form-data">
+                <div class="modal-body">
+                    <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
+                    <input type="hidden" name="tugas_id" id="modalTugasId">
+
+                    <div id="jawabanDinamis"></div>
+                    <div id="areaUploadJawaban">
+                    <div class="upload-choice mb-3">
+                        <label class="form-label fw-semibold"><i class="fa-solid fa-camera text-primary me-1"></i>Ambil Foto Jawaban</label>
+                        <input type="file" name="foto_kamera" id="cameraInput" class="form-control" accept="image/*" capture="environment">
+                        <div class="form-text">Kamera belakang akan dibuka pada perangkat yang mendukung.</div>
+                    </div>
+                    <div class="text-center text-muted small mb-3"><span class="bg-white px-2">atau</span></div>
+                    <div class="upload-choice mb-3">
+                        <label class="form-label fw-semibold"><i class="fa-solid fa-folder-open text-primary me-1"></i>Pilih File dari Perangkat</label>
+                        <input type="file" name="file_jawaban" id="fileInput" class="form-control" accept=".pdf,.docx,.zip,.rar,.png,.jpg,.jpeg,.webp,.heic,.heif">
+                        <div class="form-text">PDF, DOCX, ZIP/RAR, JPG/JPEG, PNG, WEBP, atau HEIC · maksimal 10 MB.</div>
+                    </div>
+                    <div id="cameraPreviewWrap" class="d-none mb-3"><div class="d-flex justify-content-between align-items-center mb-2"><small class="fw-semibold text-success"><i class="fa-solid fa-circle-check me-1"></i>Foto siap dikirim</small><button type="button" class="btn btn-sm btn-link text-danger p-0" id="removeCameraPhoto">Hapus foto</button></div><img id="cameraPreview" class="camera-preview" alt="Preview foto jawaban"></div>
+                    <div id="selectedFileInfo" class="alert alert-info py-2 small d-none mb-3"></div></div>
+                    <div>
+                        <div class="progress mt-3 d-none" id="uploadProgress" style="height:8px"><div class="progress-bar" style="width:0%"></div></div>
+                    </div>
+
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Batal</button>
+                    <button type="submit" class="btn btn-primary" id="submitTaskButton">Kirim Tugas</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<?php require_once __DIR__ . '/../includes/footer.php'; ?>
+
+<script>
+let submitModal,currentJenis='portofolio';
+
+$(document).ready(function() {
+    submitModal = new bootstrap.Modal(document.getElementById('submitModal'));
+
+    $('#formKirimTugas').on('submit', function(e) {
+        e.preventDefault();
+        if(currentJenis==='portofolio'&&!$('#cameraInput')[0].files.length&&!$('#fileInput')[0].files.length){Swal.fire('Pilih Jawaban','Ambil foto dengan kamera atau pilih file jawaban terlebih dahulu.','warning');return}
+        if(!this.reportValidity())return;
+        let formData = new FormData(this);
+
+        const button=$('#submitTaskButton'),progress=$('#uploadProgress'),bar=progress.find('.progress-bar');button.prop('disabled',true).html('<span class="spinner-border spinner-border-sm me-1"></span>Mengunggah...');progress.removeClass('d-none');
+        $.ajax({
+            url: 'tugas_action.php',
+            type: 'POST',
+            data: formData,
+            contentType: false,
+            processData: false,
+            xhr:function(){const xhr=$.ajaxSettings.xhr();if(xhr.upload)xhr.upload.addEventListener('progress',function(ev){if(ev.lengthComputable)bar.css('width',Math.round(ev.loaded/ev.total*100)+'%')});return xhr},
+            success: function(res) {
+                if(res.status === 'success') {
+                    submitModal.hide();
+                    Swal.fire('Berhasil!', res.message, 'success').then(() => location.reload());
+                } else {
+                    Swal.fire('Gagal!', res.message, 'error');
+                }
+            },
+            error:function(xhr){Swal.fire('Koneksi Bermasalah','Jawaban belum berhasil dikirim. Periksa internet Anda lalu coba kembali.','error')},
+            complete:function(){button.prop('disabled',false).html('Kirim Tugas');progress.addClass('d-none');bar.css('width','0%')}
+        });
+    });
+    $('#cameraInput').on('change',function(){const file=this.files[0];if(!file)return;$('#fileInput').val('');$('#selectedFileInfo').addClass('d-none');const reader=new FileReader();reader.onload=e=>{$('#cameraPreview').attr('src',e.target.result);$('#cameraPreviewWrap').removeClass('d-none')};reader.readAsDataURL(file)});
+    $('#fileInput').on('change',function(){const file=this.files[0];if(!file)return;$('#cameraInput').val('');$('#cameraPreviewWrap').addClass('d-none');URL.revokeObjectURL($('#cameraPreview').attr('src'));$('#cameraPreview').removeAttr('src');$('#selectedFileInfo').removeClass('d-none').html('<i class="fa-solid fa-paperclip me-1"></i>'+escapeHtml(file.name)+' · '+formatBytes(file.size))});
+    $('#removeCameraPhoto').on('click',function(){$('#cameraInput').val('');$('#cameraPreviewWrap').addClass('d-none');$('#cameraPreview').removeAttr('src')});
+});
+
+function openSubmitModal(tugas) {
+    $('#formKirimTugas')[0].reset();$('#cameraPreviewWrap,#selectedFileInfo,#uploadProgress').addClass('d-none');$('#cameraPreview').removeAttr('src');
+    $('#modalTugasId').val(tugas.id);
+    $('#modalTugasTitle').text('Kirim Jawaban: ' + tugas.judul);
+    currentJenis=tugas.jenis||'portofolio';
+    $('#areaUploadJawaban').toggleClass('d-none',currentJenis!=='portofolio');
+    const area=$('#jawabanDinamis').empty();
+    if(currentJenis==='esai'){
+        (tugas.pertanyaan||[]).forEach((q,i)=>area.append(`<div class="mb-3"><label class="form-label fw-semibold">${i+1}. ${escapeHtml(q.pertanyaan)}</label><textarea class="form-control" name="jawaban[${q.id}]" rows="4" maxlength="20000" required></textarea></div>`));
+    }else if(currentJenis==='pilihan_ganda'){
+        (tugas.pertanyaan||[]).forEach((q,i)=>{const pilihan=(q.opsi||[]).map(o=>`<label class="d-flex gap-2 border rounded p-2 mb-2"><input class="form-check-input flex-shrink-0" type="radio" name="jawaban[${q.id}]" value="${o.id}" required><span><strong>${escapeHtml(o.label)}.</strong> ${escapeHtml(o.teks)}</span></label>`).join('');area.append(`<div class="mb-4"><div class="fw-semibold mb-2">${i+1}. ${escapeHtml(q.pertanyaan)}</div>${pilihan}</div>`)});
+    }else if(currentJenis==='merangkum'){
+        area.html('<label class="form-label fw-semibold">Tulis Ringkasan</label><textarea class="form-control mb-3" name="jawaban_ringkasan" rows="8" minlength="10" maxlength="30000" required placeholder="Tuliskan hasil rangkuman Anda..."></textarea>');
+    }else if(currentJenis==='video'){
+        area.html('<label class="form-label fw-semibold">Tautan Video</label><input type="url" class="form-control mb-3" name="tautan_video" required placeholder="https://youtube.com/..."><div class="form-text mb-3">Unggah video ke YouTube/Google Drive, lalu kirim tautan yang dapat diakses guru.</div>');
+    }
+    submitModal.show();
+}
+function escapeHtml(value){return $('<div>').text(value).html()}
+function formatBytes(bytes){return bytes<1048576?Math.max(1,Math.round(bytes/1024))+' KB':(bytes/1048576).toFixed(1)+' MB'}
+</script>
