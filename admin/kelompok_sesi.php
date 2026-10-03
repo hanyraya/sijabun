@@ -200,37 +200,23 @@ require_once __DIR__ . '/../includes/header.php';
 
 
                     <div class="mb-3">
-
-                        <label
-                            class="form-label fw-semibold">
-
-                            Kelas
-
-                        </label>
-
-                        <select
-                            name="kelas_id"
-                            id="kelas_id"
-                            class="form-select"
-                            required>
-
-                            <option value="">
-                                -- Pilih Kelas --
-                            </option>
-
-                            <?php foreach ($kelas as $k): ?>
-
-                                <option value="<?= $k['id'] ?>">
-                                    <?= sanitize($k['nama_kelas']) ?>
-                                </option>
-
-                            <?php endforeach; ?>
-
+                        <label for="tingkat" class="form-label fw-semibold">Tingkat Kelas</label>
+                        <select name="tingkat" id="tingkat" class="form-select" required>
+                            <option value="">-- Pilih Tingkat --</option>
+                            <option value="X">X</option>
+                            <option value="XI">XI</option>
+                            <option value="XII">XII</option>
+                            <option value="semua">Semua Tingkat (Gabungan)</option>
                         </select>
-
                     </div>
-
-
+                    <div class="mb-3">
+                        <div class="d-flex justify-content-between align-items-center mb-2">
+                            <label class="form-label fw-semibold mb-0">Kelas</label>
+                            <div class="form-check"><input type="checkbox" id="selectAllKelas" class="form-check-input" disabled><label for="selectAllKelas" class="form-check-label">Pilih Semua Kelas</label></div>
+                        </div>
+                        <div id="daftarKelas" class="border rounded p-3" style="max-height:180px;overflow-y:auto;"></div>
+                        <small class="text-muted">Kelas mengikuti tingkat yang dipilih. Centang satu atau beberapa kelas untuk menggabungkan peserta.</small>
+                    </div>
                     <div class="mb-3">
 
                         <div class="d-flex justify-content-between align-items-center mb-2">
@@ -358,6 +344,7 @@ require_once __DIR__ . '/../includes/header.php';
 
 
 <script>
+const dataKelas = <?= json_encode($kelas, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_UNICODE) ?>;
 const dataSiswa = <?= json_encode($siswa, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_UNICODE) ?>;
 const dataKelompokSesi = <?= json_encode($kelompokSesi, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_UNICODE) ?>;
 const csrfToken = <?= json_encode($_SESSION['csrf_token']) ?>;

@@ -7,6 +7,9 @@ $db = Database::getInstance();
 foreach (explode(';', file_get_contents(__DIR__ . '/../database/2026_10_03_kelompok_sesi.sql')) as $sql) {
     if (trim($sql) !== '') $db->exec($sql);
 }
+foreach (explode(';', file_get_contents(__DIR__ . '/../database/2026_10_03_kelompok_sesi_multi_kelas.sql')) as $sql) {
+    if (trim($sql) !== '') $db->exec($sql);
+}
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     header('Content-Type: application/json; charset=utf-8');
     try {
@@ -28,16 +31,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $stmt->execute([$id]);
         } else {
             $nama = trim((string)($_POST['nama_kelompok'] ?? ''));
-            $kelasId = (int)($_POST['kelas_id'] ?? 0);
+            $rawKelas = $_POST['kelas_ids'] ?? [];
+            $tingkat = $_POST['tingkat'] ?? '';
+            if (!is_array($rawKelas)) throw new InvalidArgumentException('Daftar kelas tidak valid.');
+            $kelasIds = array_values(array_unique(array_map('intval', $rawKelas)));
             $rawIds = $_POST['siswa_ids'] ?? [];
             if (!is_array($rawIds)) throw new InvalidArgumentException('Daftar siswa tidak valid.');
             $ids = array_values(array_unique(array_map('intval', $rawIds)));
-            if ($nama === '' || mb_strlen($nama) > 100 || !$kelasId || !$ids || min($ids) <= 0) {
-                throw new InvalidArgumentException('Isi nama kelompok (maksimal 100 karakter), kelas, dan minimal satu siswa.');
+            if ($nama === '' || mb_strlen($nama) > 100 || !$kelasIds || min($kelasIds) <= 0 || !$ids || min($ids) <= 0 || !in_array($tingkat, ['X', 'XI', 'XII', 'semua'], true)) {
+                throw new InvalidArgumentException('Isi nama kelompok (maksimal 100 karakter), tingkat, minimal satu kelas, dan minimal satu siswa.');
             }
+            $kelasMarks = implode(',', array_fill(0, count($kelasIds), '?'));
+            $stmt = $db->prepare("SELECT id, tingkat FROM kelas WHERE id IN ($kelasMarks) FOR UPDATE");
+            $stmt->execute($kelasIds);
+            $validKelas = $stmt->fetchAll();
+            if (count($validKelas) !== count($kelasIds)) throw new InvalidArgumentException('Kelas tidak valid.');
+            foreach ($validKelas as $k) {
+                if ($tingkat !== 'semua' && $k['tingkat'] !== $tingkat) throw new InvalidArgumentException('Kelas harus sesuai tingkat yang dipilih.');
+            }
+            $kelasId = $kelasIds[0];
             $marks = implode(',', array_fill(0, count($ids), '?'));
-            $stmt = $db->prepare("SELECT id FROM siswa WHERE kelas_id = ? AND id IN ($marks) FOR UPDATE");
-            $stmt->execute(array_merge([$kelasId], $ids));
+            $stmt = $db->prepare("SELECT id FROM siswa WHERE kelas_id IN ($kelasMarks) AND id IN ($marks) FOR UPDATE");
+            $stmt->execute(array_merge($kelasIds, $ids));
             if (count($stmt->fetchAll()) !== count($ids)) throw new InvalidArgumentException('Semua peserta harus berasal dari kelas yang dipilih. Muat ulang jika data siswa berubah.');
             if ($action === 'create') {
                 $stmt = $db->prepare('INSERT INTO kelompok_sesi (nama_kelompok, kelas_id) VALUES (?, ?)');
@@ -49,6 +64,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $stmt = $db->prepare('DELETE FROM kelompok_sesi_siswa WHERE kelompok_sesi_id = ?');
                 $stmt->execute([$id]);
             }
+            $stmt = $db->prepare('DELETE FROM kelompok_sesi_kelas WHERE kelompok_sesi_id = ?');
+            $stmt->execute([$id]);
+            $stmt = $db->prepare('INSERT INTO kelompok_sesi_kelas (kelompok_sesi_id, kelas_id) VALUES (?, ?)');
+            foreach ($kelasIds as $kid) $stmt->execute([$id, $kid]);
             $stmt = $db->prepare('INSERT INTO kelompok_sesi_siswa (kelompok_sesi_id, siswa_id) VALUES (?, ?)');
             foreach ($ids as $sid) $stmt->execute([$id, $sid]);
         }
@@ -62,14 +81,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
     exit;
 }
-$kelas = $db->query('SELECT id, nama_kelas FROM kelas ORDER BY nama_kelas')->fetchAll();
-$siswa = $db->query('SELECT s.id, s.kelas_id, s.nis, s.nisn, s.nama_lengkap FROM siswa s LEFT JOIN kelas k ON k.id = s.kelas_id ORDER BY k.nama_kelas, s.nama_lengkap')->fetchAll();
-$kelompokSesi = $db->query('SELECT ks.*, k.nama_kelas AS kelas,
-    (SELECT COUNT(*) FROM kelompok_sesi_siswa a JOIN siswa s ON s.id = a.siswa_id WHERE a.kelompok_sesi_id = ks.id AND s.kelas_id = ks.kelas_id) AS jumlah_peserta
-    FROM kelompok_sesi ks JOIN kelas k ON k.id = ks.kelas_id ORDER BY ks.id DESC')->fetchAll();
+$kelas = $db->query('SELECT id, nama_kelas, tingkat FROM kelas ORDER BY FIELD(tingkat, "X", "XI", "XII"), nama_kelas')->fetchAll();
+$siswa = $db->query('SELECT s.id, s.kelas_id, s.nis, s.nisn, s.nama_lengkap, k.nama_kelas FROM siswa s LEFT JOIN kelas k ON k.id = s.kelas_id ORDER BY k.nama_kelas, s.nama_lengkap')->fetchAll();
+$kelompokSesi = $db->query('SELECT ks.*,
+    (SELECT GROUP_CONCAT(k.nama_kelas ORDER BY k.nama_kelas SEPARATOR ", ") FROM kelompok_sesi_kelas kk JOIN kelas k ON k.id = kk.kelas_id WHERE kk.kelompok_sesi_id = ks.id) AS kelas,
+    (SELECT COUNT(*) FROM kelompok_sesi_siswa a JOIN siswa s ON s.id = a.siswa_id JOIN kelompok_sesi_kelas kk ON kk.kelompok_sesi_id = a.kelompok_sesi_id AND kk.kelas_id = s.kelas_id WHERE a.kelompok_sesi_id = ks.id) AS jumlah_peserta
+    FROM kelompok_sesi ks ORDER BY ks.id DESC')->fetchAll();
 $anggota = [];
-foreach ($db->query('SELECT a.kelompok_sesi_id, a.siswa_id FROM kelompok_sesi_siswa a JOIN kelompok_sesi ks ON ks.id = a.kelompok_sesi_id JOIN siswa s ON s.id = a.siswa_id AND s.kelas_id = ks.kelas_id')->fetchAll() as $row) {
+foreach ($db->query('SELECT a.kelompok_sesi_id, a.siswa_id FROM kelompok_sesi_siswa a JOIN siswa s ON s.id = a.siswa_id JOIN kelompok_sesi_kelas kk ON kk.kelompok_sesi_id = a.kelompok_sesi_id AND kk.kelas_id = s.kelas_id')->fetchAll() as $row) {
     $anggota[(int)$row['kelompok_sesi_id']][] = (int)$row['siswa_id'];
 }
-foreach ($kelompokSesi as &$kelompok) $kelompok['siswa_ids'] = $anggota[(int)$kelompok['id']] ?? [];
+$kelasKelompok = [];
+foreach ($db->query('SELECT kelompok_sesi_id, kelas_id FROM kelompok_sesi_kelas')->fetchAll() as $row) {
+    $kelasKelompok[(int)$row['kelompok_sesi_id']][] = (int)$row['kelas_id'];
+}
+foreach ($kelompokSesi as &$kelompok) {
+    $kelompok['siswa_ids'] = $anggota[(int)$kelompok['id']] ?? [];
+    $kelompok['kelas_ids'] = $kelasKelompok[(int)$kelompok['id']] ?? [];
+}
 unset($kelompok);
